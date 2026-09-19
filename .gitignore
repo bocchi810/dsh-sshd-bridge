@@ -1,0 +1,17 @@
+# 本仓库只放源码与脚本；二进制与密钥都由 CI 构建/注入，绝不入库。
+dropbear-src/
+dropbear-native/
+out/
+out-native/
+build-test/
+ci-dist/
+keys/
+assets/
+adbhome/
+tools/*.jar
+tools/x/
+verify-download-route.mjs
+*.apk
+*.apk.sha256
+*.tar.bz2
+*.debug

@@ -1,0 +1,174 @@
+name: build-sshd-bridge
+
+# 交叉编译 dropbear（两种链接方式）并组装 root SSH 桥 APK，产物发到 Release。
+#
+# 缓存策略：
+#   - NDK：按版本号缓存（首次 ~4 分钟，之后秒级命中）
+#   - dropbear 产物：按「构建脚本 + 源码版本 + API」哈希缓存；命中则整个编译步骤跳过
+#   - 构建工具（aapt2/r8/apksig/android.jar）：体积小，每次直接拉，避免陈旧工具链
+on:
+  workflow_dispatch:
+    inputs:
+      version_code:
+        description: 'versionCode'
+        required: false
+        default: '20'
+      version_name:
+        description: 'versionName'
+        required: false
+        default: '20.0'
+      tag:
+        description: 'Release tag（同名则更新）'
+        required: false
+        default: 'apk-latest'
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '**.md'
+
+permissions:
+  contents: write
+
+env:
+  NDK_VERSION: r27c
+  DROPBEAR_VER: '2026.94'
+  API: '35'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # ---------- 缓存 ----------
+      - name: 缓存 NDK
+        id: ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ndk
+          key: ndk-${{ env.NDK_VERSION }}-linux
+
+      - name: 缓存 dropbear 产物
+        id: db-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            out-native
+            assets
+          key: dropbear-${{ env.DROPBEAR_VER }}-api${{ env.API }}-${{ hashFiles('ci/build-dropbear.sh') }}
+
+      # ---------- NDK ----------
+      - name: 安装 NDK ${{ env.NDK_VERSION }}
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ndk"
+          curl -fsSL -o /tmp/ndk.zip \
+            "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
+          unzip -q /tmp/ndk.zip -d "$RUNNER_TEMP/ndk"
+          rm -f /tmp/ndk.zip
+
+      - name: 导出 NDK 路径
+        run: echo "ANDROID_NDK_HOME=$RUNNER_TEMP/ndk/android-ndk-${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      # ---------- dropbear ----------
+      - name: 编译 dropbear（缓存命中则跳过）
+        if: steps.db-cache.outputs.cache-hit != 'true'
+        run: bash ci/build-dropbear.sh
+
+      - name: 校验缓存的产物仍可用
+        run: |
+          set -euo pipefail
+          for f in assets/dsh-dropbear assets/dsh-dropbear_dyn \
+                   assets/dsh-dropbearkey assets/dsh-dropbearkey_dyn; do
+            test -s "$f" || { echo "缺少 $f"; exit 1; }
+          done
+          for f in assets/dsh-dropbear assets/dsh-dropbear_dyn; do
+            strings -a "$f" | grep -q 'dsh-nopermcheck' \
+              || { echo "$f 缺补丁标记 → 缓存或补丁有问题"; exit 1; }
+            echo "OK $f"
+          done
+
+      # ---------- 主机密钥 ----------
+      # 从仓库 Secret 注入，**不落进 git**（仓库是公开的，主机密钥属敏感材料）。
+      # 主机密钥只用于服务端向客户端证明身份，不是登录凭据；但仍不该公开。
+      # 未配置 Secret 时回落到"生成一个"，此时指纹会每次变化，需重新核对。
+      - name: 准备主机密钥（从 Secret 注入）
+        env:
+          HOSTKEY_B64: ${{ secrets.HOSTKEY_PRIV_B64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p keys
+          rm -f keys/hostkey_ed25519 keys/hostkey_ed25519.pub
+          if [ -n "${HOSTKEY_B64:-}" ]; then
+            printf '%s' "$HOSTKEY_B64" | base64 -d > keys/hostkey_ed25519
+            echo "已从 Secret HOSTKEY_PRIV_B64 注入主机密钥"
+          else
+            echo "::warning::未配置 secrets.HOSTKEY_PRIV_B64 → 将新生成一把（指纹每次构建都会变）"
+          fi
+          chmod 600 keys/hostkey_ed25519 2>/dev/null || true
+          # 幂等脚本：已有密钥就保留并只做结构校验 + 推导 .pub；
+          # 没有才用原生编译的 dropbearkey 生成（密钥是 SSH 线格式、长度字段大端，
+          # 与 CPU 字节序无关，x86_64 生成的可直接给 aarch64 用）。
+          bash ci/build-native-keygen.sh
+          cp keys/hostkey_ed25519 assets/dsh-hostkey_ed25519
+          cp keys/hostkey_ed25519.pub assets/dsh-hostkey_ed25519.pub
+          echo "指纹: $(ssh-keygen -lf keys/hostkey_ed25519.pub 2>/dev/null || echo '(无法计算)')"
+
+      - name: 写入客户端公钥
+        run: |
+          set -euo pipefail
+          # 容器侧的客户端公钥（只含公钥，泄露无害）。可在仓库变量 CLIENT_PUBKEY 覆盖。
+          PUB="${{ vars.CLIENT_PUBKEY }}"
+          if [ -z "$PUB" ]; then
+            PUB="$(cat ci/client.pub)"
+          fi
+          printf '%s\n' "$PUB" > assets/dsh-client.pub
+          cut -c1-60 assets/dsh-client.pub
+
+      # ---------- APK ----------
+      - name: 组装并签名 APK
+        env:
+          VERSION_CODE: ${{ github.event.inputs.version_code || '20' }}
+          VERSION_NAME: ${{ github.event.inputs.version_name || '20.0' }}
+        run: bash ci/build-apk.sh
+
+      # ---------- 上传 ----------
+      - name: 上传 Action artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sshd-bridge-apk
+          path: |
+            out/sshd-bridge-debug.apk
+            out/sshd-bridge-debug.apk.sha256
+
+      - name: 发布到 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || 'apk-latest' }}
+        run: |
+          set -euo pipefail
+          OK=0
+          for i in 1 2 3; do
+            if gh release create "$TAG" \
+                 --repo "$GITHUB_REPOSITORY" \
+                 --title "sshd-bridge $TAG" \
+                 --notes "dropbear ${DROPBEAR_VER} (dyn+static, 含跳过父目录权限检查补丁) / NDK ${NDK_VERSION} / API ${API}" \
+                 --prerelease; then OK=1; break; fi
+            sleep 5
+            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then OK=1; break; fi
+          done
+          [ "$OK" = 1 ] || { echo "创建 Release 失败"; exit 1; }
+          gh release upload "$TAG" \
+            --repo "$GITHUB_REPOSITORY" --clobber \
+            out/sshd-bridge-debug.apk out/sshd-bridge-debug.apk.sha256 \
+            keys/hostkey_ed25519 keys/hostkey_ed25519.pub
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[] | "\(.name)\t\(.size)"'
