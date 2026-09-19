@@ -245,35 +245,55 @@ public final class SshdCore {
     }
 
     /**
-     * 3. 主机密钥：先试设备端 dropbearkey 现生成；**失败则落回 App 内嵌的预生成密钥**。
+     * 3. 主机密钥：**在设备上生成**，仓库 / Release / APK 都不携带任何私钥。
      *
-     * <p>为什么要有兜底：真机实测 dropbearkey 段错误（SIGSEGV），主机密钥生成不出来，
-     * 后续 dropbear -r 找不到 hostkey 直接退出（exit=139）。内嵌密钥由容器原生编译的
-     * dropbearkey 生成——格式为 SSH 线格式、长度字段大端（src/buffer.c buf_putint 用 STORE32H），
-     * 与 CPU 字节序无关，故 x86_64 生成的密钥可直接给 aarch64 使用。
+     * <p>历史教训：早期版本把主机密钥（含私钥部分）内嵌进 APK 并作为 Release 资产分发，
+     * 这是错的 —— 私钥就是私钥，不该出现在公开分发物里。当初走那条路是因为设备端 keygen
+     * 段错误；但那个段错误来自**静态 static-PIE 二进制**（设备内核不支持 static-PIE 自举），
+     * **动态版是好的**（探测 `dropbearkey -h` 返回 exit=0）。所以现在改为：
      *
-     * <p>并且**必须校验结果**：上一版生成失败后照样往下跑，最后只报「SSH 未监听」，
-     * 把真正的原因（密钥没生成）埋掉了。
+     * <ol>
+     *   <li>用动态版 {@code dropbearkey_dyn} 生成；</li>
+     *   <li>失败则退回静态版 {@code dropbearkey}；</li>
+     *   <li>都失败才用构建时注入的兜底密钥（仅当构建确实注入过才存在）。</li>
+     * </ol>
+     *
+     * <p>生成失败会**显式报错**，不再静默往下跑（早期版本正是这样把真因埋掉的）。
      */
     public static String planHostKey(String srcDir) {
         return prelude()
                 + "SRC='" + srcDir + "'\n"
-                + "if [ ! -s \"$BASE/hostkey_ed25519\" ]; then\n"
-                + "  echo '设备端没有可用主机密钥：直接使用内嵌的预生成密钥'\n"
-                + "  if cp \"$SRC/hostkey_ed25519\" \"$BASE/hostkey_ed25519\" 2>&1; then\n"
-                + "    echo '已写入内嵌密钥'\n"
-                + "  else\n"
-                + "    echo 'FAILED 内嵌密钥写入失败'\n"
-                + "  fi\n"
+                + "H=\"$BASE/hostkey_ed25519\"\n"
+                + "if [ -s \"$H\" ]; then\n"
+                + "  echo '主机密钥已存在，跳过生成'\n"
                 + "else\n"
-                + "  echo '主机密钥已存在，跳过'\n"
+                + "  rm -f \"$H\" \"$H.pub\" 2>/dev/null\n"
+                + "  for V in \"$BASE/dropbearkey_dyn\" \"$BASE/dropbearkey\"; do\n"
+                + "    [ -x \"$V\" ] || continue\n"
+                + "    echo \"尝试用 $(basename \"$V\") 生成主机密钥...\"\n"
+                + "    if command -v timeout >/dev/null 2>&1; then\n"
+                + "      timeout 20 \"$V\" -t ed25519 -f \"$H\" >/dev/null 2>&1; R=$?\n"
+                + "    else\n"
+                + "      \"$V\" -t ed25519 -f \"$H\" >/dev/null 2>&1; R=$?\n"
+                + "    fi\n"
+                + "    if [ -s \"$H\" ]; then echo \"  生成成功（exit=$R）\"; break; fi\n"
+                + "    echo \"  失败（exit=$R），换下一个变体\"\n"
+                + "  done\n"
+                + "  if [ ! -s \"$H\" ] && [ -s \"$SRC/hostkey_ed25519\" ]; then\n"
+                + "    echo '设备端生成不可用，使用构建时注入的兜底密钥'\n"
+                + "    cp \"$SRC/hostkey_ed25519\" \"$H\" 2>&1\n"
+                + "  fi\n"
                 + "fi\n"
-                + "chmod 600 \"$BASE/hostkey_ed25519\" 2>/dev/null\n"
-                + "chown 0:0 \"$BASE/hostkey_ed25519\" 2>/dev/null\n"
-                + "restorecon \"$BASE/hostkey_ed25519\" 2>/dev/null\n"
-                + "SZ=$(wc -c < \"$BASE/hostkey_ed25519\" 2>/dev/null || echo 0)\n"
+                + "chmod 600 \"$H\" 2>/dev/null\n"
+                + "chown 0:0 \"$H\" 2>/dev/null\n"
+                + "restorecon \"$H\" 2>/dev/null\n"
+                + "SZ=$(wc -c < \"$H\" 2>/dev/null || echo 0)\n"
                 + "echo \"hostkey 大小: $SZ\"\n"
-                + "if [ \"$SZ\" -gt 64 ] 2>/dev/null; then echo 'hostkey 可用: yes'; else echo 'hostkey 可用: no'; fi\n";
+                + "if [ \"$SZ\" -gt 64 ] 2>/dev/null; then echo 'hostkey 可用: yes'; else echo 'hostkey 可用: no'; fi\n"
+                + "if [ -x \"$BASE/dropbear_dyn\" ] && [ -s \"$H\" ]; then\n"
+                + "  F=$(\"$BASE/dropbear_dyn\" -y -f \"$H\" 2>/dev/null | grep '^ssh-ed25519')\n"
+                + "  [ -n \"$F\" ] && echo \"hostkey 指纹: $F\"\n"
+                + "fi\n";
     }
 
     /**

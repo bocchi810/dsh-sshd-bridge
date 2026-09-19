@@ -96,31 +96,21 @@ jobs:
             echo "OK $f"
           done
 
-      # ---------- 主机密钥 ----------
-      # 从仓库 Secret 注入，**不落进 git**（仓库是公开的，主机密钥属敏感材料）。
-      # 主机密钥只用于服务端向客户端证明身份，不是登录凭据；但仍不该公开。
-      # 未配置 Secret 时回落到"生成一个"，此时指纹会每次变化，需重新核对。
-      - name: 准备主机密钥（从 Secret 注入）
-        env:
-          HOSTKEY_B64: ${{ secrets.HOSTKEY_PRIV_B64 }}
+      # ---------- 主机密钥：不注入任何私钥 ----------
+      # 主机密钥由 App 在**设备上**用 dropbearkey_dyn 生成（动态版可用；静态 static-PIE
+      # 版在该设备上段错误，所以才改成动态版优先）。
+      # 仓库、Release、APK 都不携带私钥 —— 私钥就是私钥，不该出现在公开分发物里。
+      - name: 确认构建物不含任何密钥
         run: |
           set -euo pipefail
-          mkdir -p keys
-          rm -f keys/hostkey_ed25519 keys/hostkey_ed25519.pub
-          if [ -n "${HOSTKEY_B64:-}" ]; then
-            printf '%s' "$HOSTKEY_B64" | base64 -d > keys/hostkey_ed25519
-            echo "已从 Secret HOSTKEY_PRIV_B64 注入主机密钥"
-          else
-            echo "::warning::未配置 secrets.HOSTKEY_PRIV_B64 → 将新生成一把（指纹每次构建都会变）"
+          rm -f "$GITHUB_WORKSPACE"/keys/hostkey_ed25519* 2>/dev/null || true
+          rm -f "$GITHUB_WORKSPACE"/assets/dsh-hostkey_ed25519* 2>/dev/null || true
+          echo "assets 内容（应只有二进制与客户端公钥）："
+          ls -la assets/
+          if [ -e assets/dsh-hostkey_ed25519 ]; then
+            echo "::error::构建物里出现了主机密钥私钥，拒绝继续"; exit 1
           fi
-          chmod 600 keys/hostkey_ed25519 2>/dev/null || true
-          # 幂等脚本：已有密钥就保留并只做结构校验 + 推导 .pub；
-          # 没有才用原生编译的 dropbearkey 生成（密钥是 SSH 线格式、长度字段大端，
-          # 与 CPU 字节序无关，x86_64 生成的可直接给 aarch64 用）。
-          bash ci/build-native-keygen.sh
-          cp keys/hostkey_ed25519 assets/dsh-hostkey_ed25519
-          cp keys/hostkey_ed25519.pub assets/dsh-hostkey_ed25519.pub
-          echo "指纹: $(ssh-keygen -lf keys/hostkey_ed25519.pub 2>/dev/null || echo '(无法计算)')"
+          echo "OK：无任何主机密钥进入构建"
 
       - name: 写入客户端公钥
         run: |
@@ -168,7 +158,6 @@ jobs:
           [ "$OK" = 1 ] || { echo "创建 Release 失败"; exit 1; }
           gh release upload "$TAG" \
             --repo "$GITHUB_REPOSITORY" --clobber \
-            out/sshd-bridge-debug.apk out/sshd-bridge-debug.apk.sha256 \
-            keys/hostkey_ed25519 keys/hostkey_ed25519.pub
+            out/sshd-bridge-debug.apk out/sshd-bridge-debug.apk.sha256
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
             --jq '.assets[] | "\(.name)\t\(.size)"'

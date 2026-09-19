@@ -34,7 +34,7 @@ AAPT2="$T/x/aapt2"
 # ---------- 2. assets 检查（命名必须让「去 dsh- 前缀」== 设备端目标名） ----------
 echo "== assets =="
 ls -la "$ASSETS"
-for f in dsh-dropbear dsh-dropbear_dyn dsh-dropbearkey dsh-dropbearkey_dyn dsh-client.pub dsh-hostkey_ed25519; do
+for f in dsh-dropbear dsh-dropbear_dyn dsh-dropbearkey dsh-dropbearkey_dyn dsh-client.pub; do
   [ -s "$ASSETS/$f" ] || { echo "缺少 assets/$f" >&2; exit 1; }
   printf '  %-26s %9s 字节 -> 设备端 %s\n' "$f" "$(stat -c%s "$ASSETS/$f")" "${f#dsh-}"
 done
@@ -102,7 +102,6 @@ REQUIRED = {
     "dsh-dropbearkey": "dropbearkey",
     "dsh-dropbear_dyn": "dropbear_dyn",
     "dsh-dropbearkey_dyn": "dropbearkey_dyn",
-    "dsh-hostkey_ed25519": "hostkey_ed25519",
     "dsh-client.pub": "client.pub",
 }
 src_dir = os.environ["ASSETS_DIR"]

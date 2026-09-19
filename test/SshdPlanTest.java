@@ -103,7 +103,9 @@ public class SshdPlanTest {
         new File(SB + "/local/tmp/dsh-sshd/hostkey_ed25519").delete();
         String out5 = run(SshdCore.planHostKey(tmpSrc), env);
         System.out.println(out5);
-        check("直接使用内嵌预生成密钥", out5.contains("使用内嵌的预生成密钥"), "");
+        // 主机密钥必须由设备自己生成，构建流程不携带私钥
+        check("优先用动态版 dropbearkey 生成", out5.contains("dropbearkey_dyn") || SshdCore.planHostKey(tmpSrc).contains("dropbearkey_dyn"), "");
+        check("脚本里没有把内嵌私钥直接 cp 过去的主路径", SshdCore.planHostKey(tmpSrc).contains("设备端生成不可用"), "");
         check("兜底后 hostkey 可用", out5.contains("hostkey 可用: yes"), "");
         File hk = new File(SB + "/local/tmp/dsh-sshd/hostkey_ed25519");
         check("主机密钥确已落盘且 >64 字节", hk.exists() && hk.length() > 64, "大小=" + hk.length());
