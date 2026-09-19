@@ -248,6 +248,17 @@ public class MainActivity extends Activity {
         return new File(ext, "dsh-sshd-state.txt").getAbsolutePath();
     }
 
+    /** 启动诊断的落点（与 dsh-sshd-state.txt 同目录，容器可直接读）。 */
+    private String startDiagPath() {
+        File ext = null;
+        try {
+            ext = getExternalFilesDir(null);
+        } catch (Throwable ignored) {
+        }
+        if (ext == null) ext = getFilesDir();
+        return new File(ext, "dsh-sshd-start-diag.txt").getAbsolutePath();
+    }
+
     private void doDiag() {
         setBusy(true);
         new Thread(new Runnable() {
@@ -301,6 +312,13 @@ public class MainActivity extends Activity {
 
                     r.deviceIp = SshdCore.detectIpv4();
                     append(r.text());
+
+                    // 启动前把"谁占着端口 / pkill 结果 / 能否 bind"写进共享存储：
+                    // 容器侧可直接读，不必再靠界面滚动内容推断。
+                    String sp = startDiagPath();
+                    append("\n导出启动诊断到 " + sp + " …\n");
+                    append(SshdCore.probeStart(sp).all() + "\n");
+
                     append("\n正在启动 dropbear（前台运行，日志会持续输出）…\n\n");
 
                     serverRunning = true;

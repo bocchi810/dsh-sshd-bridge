@@ -576,6 +576,59 @@ public final class SshdCore {
         return ShellRunner.runFirstOk(planFixPerms(), ROOT_SHELLS);
     }
 
+    /**
+     * 把「占用端口的进程 + pkill 结果 + 启动输出」全部落盘到共享存储，供容器侧直接读。
+     *
+     * <p>为什么需要：真机上出现过「旧 daemon 一直占着 2222、新进程起不来」，而 App 的
+     * pkill 结果、启动报错、退出码全都只在界面上滚动，容器侧看不到，导致只能靠推断。
+     * 这个脚本把这些证据写进文件，一次读完。
+     */
+    public static String planStartDiag(String outPath) {
+        String hex = Integer.toHexString(PORT).toUpperCase();
+        return prelude()
+                + "O='" + outPath + "'\n"
+                + "rm -f \"$O\" 2>/dev/null\n"
+                + "P() { echo \"$@\" >> \"$O\"; }\n"
+                + "P \"=== 启动诊断 $(date) ===\"\n"
+                + "P '--- 占用 " + PORT + " 的 socket（/proc/net/tcp）---'\n"
+                + "{ cat /proc/net/tcp /proc/net/tcp6; } 2>/dev/null | awk '$2 ~ /:" + hex + "$/ {print}' >> \"$O\" 2>&1\n"
+                + "P '--- 全部 dropbear 进程（含命令行）---'\n"
+                + "ps -A -o USER,PID,PPID,NAME 2>/dev/null | grep -i dropbear >> \"$O\" 2>&1\n"
+                + "for D in /proc/[0-9]*; do\n"
+                + "  C=$(tr '\\0' ' ' < \"$D/cmdline\" 2>/dev/null)\n"
+                + "  case \"$C\" in *dropbear*) P \"  $D -> $C\";; esac\n"
+                + "done\n"
+                + "P '--- 尝试 pkill（与 App 启动前同一模式）---'\n"
+                + "pkill -f \"$BASE/dropbear\" 2>&1 && P 'pkill 返回 0' || P \"pkill 返回 $?\"\n"
+                + "sleep 1\n"
+                + "P '--- pkill 之后仍在的 dropbear 进程 ---'\n"
+                + "for D in /proc/[0-9]*; do\n"
+                + "  C=$(tr '\\0' ' ' < \"$D/cmdline\" 2>/dev/null)\n"
+                + "  case \"$C\" in *dropbear*) P \"  仍在: $D -> $C\";; esac\n"
+                + "done\n"
+                + "P '--- pkill 之后端口是否仍被占 ---'\n"
+                + "{ cat /proc/net/tcp /proc/net/tcp6; } 2>/dev/null | awk '$2 ~ /:" + hex + "$/ {print}' >> \"$O\" 2>&1\n"
+                + "P '--- 选定变体与 authdir ---'\n"
+                + "cat \"$BASE/dropbear.active\" >> \"$O\" 2>&1\n"
+                + "cat \"$BASE/authdir\" >> \"$O\" 2>&1\n"
+                + "P '--- 用选定的二进制试启动 5 秒（只看能否 bind）---'\n"
+                + "A=$(cat \"$BASE/authdir\" 2>/dev/null); [ -n \"$A\" ] || A=\"$BASE\"\n"
+                + "C=$(cat \"$BASE/dropbear.active\" 2>/dev/null); [ -x \"$C\" ] || C=\"$BASE/dropbear_dyn\"\n"
+                + "( \"$C\" -F -s -p " + PORT + " -r \"$BASE/hostkey_ed25519\" -D \"$A\" -c /system/bin/sh ) >> \"$O\" 2>&1 &\n"
+                + "SP=$!\n"
+                + "sleep 5\n"
+                + "if kill -0 \"$SP\" 2>/dev/null; then P '  5 秒后进程仍存活 → bind 成功'; else P '  5 秒内已退出 → bind 失败（见上面输出）'; fi\n"
+                + "kill \"$SP\" 2>/dev/null\n"
+                + "sleep 1\n"
+                + "chmod 644 \"$O\" 2>/dev/null\n"
+                + "echo \"启动诊断已写入 $O（$(wc -c < \"$O\" 2>/dev/null) 字节）\"\n";
+    }
+
+    /** 运行启动诊断。 */
+    public static ShellRunner.Result probeStart(String outPath) {
+        return ShellRunner.runFirstOk(planStartDiag(outPath), ROOT_SHELLS);
+    }
+
     /** 独立导出诊断（供「导出诊断」按钮使用）。 */
     public static ShellRunner.Result exportDiag(String outPath) {
         return ShellRunner.runFirstOk(planDiag(outPath), ROOT_SHELLS);
