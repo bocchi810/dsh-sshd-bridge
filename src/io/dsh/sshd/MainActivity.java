@@ -271,6 +271,8 @@ public class MainActivity extends Activity {
                     append(r.all() + "\n");
                     append("\n--- 权限探针 ---\n");
                     append(SshdCore.probePerms().all() + "\n");
+                    append("\n--- 启动诊断（只读探查，会短暂试启动后立即结束）---\n");
+                    append(SshdCore.probeStart(startDiagPath()).all() + "\n");
                 } catch (Throwable t) {
                     append("异常: " + t + "\n");
                 } finally {
@@ -313,12 +315,9 @@ public class MainActivity extends Activity {
                     r.deviceIp = SshdCore.detectIpv4();
                     append(r.text());
 
-                    // 启动前把"谁占着端口 / pkill 结果 / 能否 bind"写进共享存储：
-                    // 容器侧可直接读，不必再靠界面滚动内容推断。
-                    String sp = startDiagPath();
-                    append("\n导出启动诊断到 " + sp + " …\n");
-                    append(SshdCore.probeStart(sp).all() + "\n");
-
+                    // 刻意**不在启动路径里跑诊断**：启动诊断结尾会"试启动 5 秒再 kill"，
+                    // 那一刀会误杀这里刚起的 daemon（真机上就是这么把自己的服务杀掉的）。
+                    // 诊断只放在独立的 ④ 按钮里，按需手动跑。
                     append("\n正在启动 dropbear（前台运行，日志会持续输出）…\n\n");
 
                     serverRunning = true;
